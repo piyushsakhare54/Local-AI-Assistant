@@ -1,0 +1,34 @@
+{
+  "name": "local-ai-conversation-assistant-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "main.cjs",
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev-frontend\" \"wait-on http://127.0.0.1:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "dev:all": "concurrently -k -n backend,desktop \"npm:dev-backend\" \"npm:dev\"",
+    "dev-backend": "node dev-backend.cjs",
+    "dev-frontend": "node dev-frontend.cjs",
+    "backend": "uv run --directory .. uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8765",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && vite build",
+    "desktop": "electron ."
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "6.2.1",
+    "vite": "8.3.6",
+    "typescript": "5.7.2",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "lucide-react": "0.468.0"
+  },
+  "devDependencies": {
+    "@types/react": "18.3.12",
+    "@types/react-dom": "18.3.1",
+    "@types/node": "22.12.0",
+    "electron": "45.2.3",
+    "concurrently": "9.1.0",
+    "wait-on": "8.0.1",
+    "cross-env": "7.0.3"
+  }
+}

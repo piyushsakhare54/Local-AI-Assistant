@@ -1,0 +1,7 @@
+{
+  "name": "local-ai-conversation-assistant",
+  "private": true,
+  "scripts": {
+    "dev": "npm --prefix desktop run dev:all"
+  }
+}
