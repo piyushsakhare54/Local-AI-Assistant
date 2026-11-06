@@ -1,4 +1,12 @@
-const { app, BrowserWindow, dialog, ipcMain, session, shell } = require('electron');
+const {
+  app,
+  BrowserWindow,
+  desktopCapturer,
+  dialog,
+  ipcMain,
+  session,
+  shell,
+} = require('electron');
 const { writeFile } = require('node:fs/promises');
 const path = require('node:path');
 const { fileURLToPath } = require('node:url');
@@ -55,6 +63,37 @@ ipcMain.handle('save-summary-pdf', async (event, html, fileName) => {
   } finally {
     pdfWindow.close();
   }
+});
+
+ipcMain.handle('list-screen-sources', async (event) => {
+  if (!isTrustedAppUrl(event.senderFrame.url)) {
+    throw new Error('Screen capture is only available from the local desktop app.');
+  }
+  const sources = await desktopCapturer.getSources({
+    types: ['screen'],
+    thumbnailSize: { width: 1600, height: 900 },
+  });
+  return sources.map((source) => ({
+    id: source.id,
+    name: source.name,
+    thumbnail: `data:image/jpeg;base64,${source.thumbnail.toJPEG(65).toString('base64')}`,
+  }));
+});
+
+ipcMain.handle('capture-screen', async (event, sourceId) => {
+  if (!isTrustedAppUrl(event.senderFrame.url)) {
+    throw new Error('Screen capture is only available from the local desktop app.');
+  }
+  if (typeof sourceId !== 'string' || sourceId.length > 200) {
+    throw new Error('Select a valid screen before capturing.');
+  }
+  const sources = await desktopCapturer.getSources({
+    types: ['screen'],
+    thumbnailSize: { width: 1600, height: 900 },
+  });
+  const source = sources.find((candidate) => candidate.id === sourceId);
+  if (!source) throw new Error('The selected screen is no longer available.');
+  return { imageBase64: source.thumbnail.toJPEG(75).toString('base64') };
 });
 
 function createWindow() {

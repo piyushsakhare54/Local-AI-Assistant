@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     speech_model: str = "base"
     ollama_model: str = "qwen3:4b"
+    ollama_vision_model: str = "qwen3-vl:4b"
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property

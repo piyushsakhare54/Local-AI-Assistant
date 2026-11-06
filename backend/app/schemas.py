@@ -34,6 +34,52 @@ class AIRequest(BaseModel):
     question: str = Field(min_length=1, max_length=4000)
 
 
+class ExplainRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=4000)
+
+
+class LiveAIRequest(BaseModel):
+    transcript: str = Field(min_length=1, max_length=16000)
+    question: str | None = Field(default=None, max_length=1000)
+    auto_answer: bool = False
+
+
+class LiveAIResponse(BaseModel):
+    answered: bool
+    response: str
+
+
+class ScreenAnalysisRequest(BaseModel):
+    image_base64: str = Field(min_length=1, max_length=7_000_000)
+    question: str = Field(
+        default="Describe the important information shown on this screen.",
+        min_length=1,
+        max_length=1000,
+    )
+    transcript: str = Field(default="", max_length=12000)
+
+
+class LiveTranscriptSegmentOut(BaseModel):
+    id: str
+    text: str
+    start_time: float
+    end_time: float
+    language: str | None
+
+
+class SessionTopicOut(BaseModel):
+    title: str
+    summary: str
+    start_time: float
+    end_time: float
+    start_segment_id: str
+    end_segment_id: str
+
+
+class SessionTopicsOut(BaseModel):
+    topics: list[SessionTopicOut]
+
+
 class AIResponse(BaseModel):
     response: str
 
@@ -114,3 +160,4 @@ class HealthOut(BaseModel):
     app: str
     speech: str
     inference: str
+    vision: str

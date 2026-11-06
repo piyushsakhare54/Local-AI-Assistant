@@ -19,7 +19,7 @@ async function start() {
     throw new Error(`Port 5173 is occupied by a non-Vite service (HTTP ${response.status}).`);
   }
   const source = await response.text();
-  if (!source.includes('Stop and transcribe') || !source.includes('/transcribe')) {
+  if (!source.includes('Stop and save transcript') || !source.includes('/live-transcribe')) {
     throw new Error(
       'An older frontend is already running on port 5173. Stop it, then run `npm run dev` again.',
     );

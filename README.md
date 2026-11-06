@@ -4,7 +4,7 @@ A privacy-first Windows desktop assistant for microphone recording, local speech
 
 ## Current status
 
-The app records microphone audio in the desktop app, transcribes it locally with Whisper after recording stops, saves the transcript to SQLite, and can answer questions about it using a local Ollama model. Recordings are kept in memory only and discarded after transcription. Transcription is not live while speaking.
+The desktop app transcribes short microphone chunks locally with Whisper while you speak and saves recognized transcript segments to SQLite as they arrive. Raw audio chunks are not saved. During a live session, you can ask for an on-device answer, optionally enable Auto Answer for clear spoken questions, and capture a screen to analyze with a local vision model. Screen images are previewed before analysis and are not saved.
 
 ## Prerequisites
 
@@ -26,6 +26,14 @@ Install [Ollama for Windows](https://ollama.com/download/windows), open a new Po
 ollama pull qwen3:4b
 ```
 
+For screen capture analysis, also install the local vision model (several GB):
+
+```powershell
+ollama pull qwen3-vl:4b
+```
+
+The standard text assistant works without the vision model; screenshot analysis remains disabled until Ollama reports the vision model as ready.
+
 Then start the backend and desktop together:
 
 ```powershell
@@ -34,7 +42,11 @@ npm run dev
 
 The first recording downloads the Whisper `base` speech model (~145 MB) to `storage\models\speech`. If a ready backend is already running on port 8765, the desktop reuses it. Check local component readiness at `http://127.0.0.1:8765/api/health`.
 
-To use it, create a session, allow microphone access, select **Start microphone**, speak, and select **Stop and transcribe**. The first transcription can take longer while the speech model downloads. After the transcript appears, choose **To the point** for a short bullet summary or **Explain in the simplest way** for a plain-language explanation, then select **Summarize transcript** to preview it or **Download PDF** to save it with the full transcript.
+To use it, create a session and select **Start microphone**. Live captions appear as you speak; use **Answer** for a response, enable **Auto Answer** to answer clear spoken questions, or open **Chat** to ask your own question about the conversation so far. Live audio is captured from the microphone only; computer/system audio is not recorded directly. The first transcription can take longer while the speech model downloads.
+During a live session, choose **Screenshot**, pick a display, review its preview, and select **Analyze on this device** to ask the local vision model about it. Screenshots are sent only to local Ollama for analysis and are not stored.
+After you stop, the saved transcript is processed locally. Choose **To the point** for a short bullet summary or **Explain in the simplest way** for a plain-language explanation, then select **Summarize transcript** to preview it or **Download PDF** to save it with the full transcript.
+The session also identifies discussion topics locally, adds their transcript timestamps, and lets you jump straight to each section. Topic sections are generated when a transcript is first opened and cached on this device.
+To explain a specific technical statement, select it in the transcript and choose **Explain selection**. The local AI returns a short, plain-language explanation.
 
 Open **Promise Tracker** in the sidebar to review explicit commitments detected in meetings, mark items pending or completed, and ask questions across meetings. Older saved transcripts can be scanned from that page. Unclear speaker identities and due dates are left unspecified; only clear completion evidence from a later transcript marks a commitment complete automatically.
 

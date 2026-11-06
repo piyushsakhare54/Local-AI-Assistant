@@ -3,6 +3,21 @@ export type Health = {
   app: string;
   speech: string;
   inference: string;
+  vision: string;
+};
+
+export type LiveTranscriptSegment = {
+  id: string;
+  text: string;
+  start_time: number;
+  end_time: number;
+  language: string | null;
+};
+
+export type ScreenSource = {
+  id: string;
+  name: string;
+  thumbnail: string;
 };
 
 export type Session = {
@@ -24,6 +39,19 @@ export type TranscriptSegment = {
   language: string | null;
   is_final: boolean;
   created_at: string;
+};
+
+export type SessionTopic = {
+  title: string;
+  summary: string;
+  start_time: number;
+  end_time: number;
+  start_segment_id: string;
+  end_segment_id: string;
+};
+
+export type SessionTopics = {
+  topics: SessionTopic[];
 };
 
 export type Commitment = {
@@ -76,6 +104,8 @@ declare global {
         html: string,
         fileName: string,
       ) => Promise<{ saved: boolean; filePath?: string }>;
+      listScreenSources: () => Promise<ScreenSource[]>;
+      captureScreen: (sourceId: string) => Promise<{ imageBase64: string }>;
     };
   }
 }

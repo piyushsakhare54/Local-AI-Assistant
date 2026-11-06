@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from typing import Annotated
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,6 +17,7 @@ from app.models import (
     ConversationContradiction,
     ConversationStatement,
     SessionRecord,
+    TopicExtraction,
     TranscriptSegment,
     now_utc,
 )
@@ -30,9 +31,16 @@ from app.schemas import (
     CommitmentStatusUpdate,
     ContradictionScanResponse,
     ConversationContradictionOut,
+    ExplainRequest,
     HealthOut,
+    LiveAIRequest,
+    LiveAIResponse,
+    LiveTranscriptSegmentOut,
+    ScreenAnalysisRequest,
     SessionCreate,
     SessionOut,
+    SessionTopicOut,
+    SessionTopicsOut,
     TranscriptSegmentOut,
     UnscannedSessionOut,
 )
@@ -41,12 +49,18 @@ from app.services.contradictions import extract_contradictions
 from app.services.local_ai import (
     LocalAIError,
     ai_status,
+    analyze_screen_image,
     answer_commitment_question,
+    answer_live_question,
     answer_question,
+    explain_technical_text,
+    vision_status,
 )
+from app.services.topic_detection import TopicTranscriptSegment, detect_topics
 from app.services.transcription import TranscriptionError, speech_status, transcribe_audio
 
 MAX_AUDIO_BYTES = 25 * 1024 * 1024
+MAX_LIVE_AUDIO_BYTES = 5 * 1024 * 1024
 
 
 @asynccontextmanager
@@ -72,6 +86,7 @@ async def health() -> HealthOut:
         app="ready",
         speech=speech_status(),
         inference=await ai_status(),
+        vision=await vision_status(),
     )
 
 
@@ -173,11 +188,233 @@ async def transcribe_session(
         )
         for segment in segments
     ]
+    if records:
+        topic_extraction = await db.get(TopicExtraction, session_id)
+        if topic_extraction is not None:
+            await db.delete(topic_extraction)
     db.add_all(records)
     await db.commit()
     for record in records:
         await db.refresh(record)
     return records
+
+
+@app.post(
+    "/api/sessions/{session_id}/live-transcribe",
+    response_model=list[LiveTranscriptSegmentOut],
+)
+async def transcribe_live_audio(
+    session_id: str,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_session)],
+    offset_seconds: Annotated[float, Query(ge=0, le=86400)] = 0,
+    unique_from_seconds: Annotated[float, Query(ge=0, le=86400)] = 0,
+) -> list[LiveTranscriptSegmentOut]:
+    if await db.get(SessionRecord, session_id) is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if unique_from_seconds > offset_seconds:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_audio_offset",
+                "message": "The unique audio offset cannot be later than the chunk offset.",
+            },
+        )
+    content = bytearray()
+    async for chunk in request.stream():
+        if len(content) + len(chunk) > MAX_LIVE_AUDIO_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail={
+                    "code": "live_audio_too_large",
+                    "message": "A live audio chunk must be smaller than 5 MB.",
+                },
+            )
+        content.extend(chunk)
+    if not content:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "empty_audio", "message": "No live audio was captured."},
+        )
+    try:
+        segments = await asyncio.to_thread(transcribe_audio, bytes(content))
+    except TranscriptionError as error:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": error.code, "message": str(error)},
+        ) from error
+
+    existing_result = await db.scalars(
+        select(TranscriptSegment).where(
+            TranscriptSegment.session_id == session_id,
+            TranscriptSegment.start_time >= max(0, offset_seconds - 2),
+            TranscriptSegment.start_time <= offset_seconds + 7,
+        )
+    )
+    existing_segments = list(existing_result)
+    records: list[TranscriptSegment] = []
+    for segment in segments:
+        start_time = offset_seconds + segment.start_time
+        if start_time < unique_from_seconds:
+            continue
+        text_key = _transcript_text_key(segment.text)
+        if any(
+            _transcript_text_key(existing.text) == text_key
+            and abs(existing.start_time - start_time) < 2
+            for existing in [*existing_segments, *records]
+        ):
+            continue
+        records.append(
+            TranscriptSegment(
+                session_id=session_id,
+                text=segment.text,
+                source="microphone",
+                start_time=start_time,
+                end_time=offset_seconds + segment.end_time,
+                language=segment.language,
+                is_final=True,
+            )
+        )
+    db.add_all(records)
+    if records:
+        topic_extraction = await db.get(TopicExtraction, session_id)
+        if topic_extraction is not None:
+            await db.delete(topic_extraction)
+        await db.commit()
+        for record in records:
+            await db.refresh(record)
+    return [
+        LiveTranscriptSegmentOut(
+            id=record.id,
+            text=record.text,
+            start_time=record.start_time,
+            end_time=record.end_time,
+            language=record.language,
+        )
+        for record in records
+    ]
+
+
+def _transcript_text_key(text: str) -> str:
+    return " ".join(text.casefold().split()).strip(" .,!?;:")
+
+
+@app.post(
+    "/api/sessions/{session_id}/live-answer",
+    response_model=LiveAIResponse,
+)
+async def answer_live_session(
+    session_id: str,
+    payload: LiveAIRequest,
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> LiveAIResponse:
+    if await db.get(SessionRecord, session_id) is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    try:
+        answered, response = await answer_live_question(
+            payload.transcript,
+            question=payload.question,
+            auto_answer=payload.auto_answer,
+        )
+    except LocalAIError as error:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": error.code, "message": str(error)},
+        ) from error
+    return LiveAIResponse(answered=answered, response=response)
+
+
+@app.post(
+    "/api/sessions/{session_id}/analyze-screen",
+    response_model=AIResponse,
+)
+async def analyze_session_screen(
+    session_id: str,
+    payload: ScreenAnalysisRequest,
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> AIResponse:
+    if await db.get(SessionRecord, session_id) is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    try:
+        response = await analyze_screen_image(
+            payload.image_base64,
+            question=payload.question,
+            transcript=payload.transcript,
+        )
+    except LocalAIError as error:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": error.code, "message": str(error)},
+        ) from error
+    return AIResponse(response=response)
+
+
+@app.post(
+    "/api/sessions/{session_id}/topics",
+    response_model=SessionTopicsOut,
+)
+async def get_session_topics(
+    session_id: str,
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> SessionTopicsOut:
+    if await db.get(SessionRecord, session_id) is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    extraction = await db.get(TopicExtraction, session_id)
+    if extraction is not None:
+        try:
+            return SessionTopicsOut.model_validate_json(extraction.topics_json)
+        except ValueError as error:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "topic_cache_invalid",
+                    "message": "Saved topic sections could not be read. Contact support.",
+                },
+            ) from error
+
+    result = await db.scalars(
+        select(TranscriptSegment)
+        .where(TranscriptSegment.session_id == session_id)
+        .order_by(TranscriptSegment.start_time, TranscriptSegment.created_at)
+    )
+    segments = list(result)
+    try:
+        detected_topics = await detect_topics(
+            [
+                TopicTranscriptSegment(
+                    id=segment.id,
+                    text=segment.text,
+                    start_time=segment.start_time,
+                    end_time=segment.end_time,
+                )
+                for segment in segments
+            ]
+        )
+    except LocalAIError as error:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": error.code, "message": str(error)},
+        ) from error
+
+    topics = [
+        SessionTopicOut(
+            title=topic.title,
+            summary=topic.summary,
+            start_time=segments[topic.start_segment_index].start_time,
+            end_time=segments[topic.end_segment_index].end_time,
+            start_segment_id=segments[topic.start_segment_index].id,
+            end_segment_id=segments[topic.end_segment_index].id,
+        )
+        for topic in detected_topics
+    ]
+    extraction = TopicExtraction(
+        session_id=session_id,
+        topics_json=SessionTopicsOut(topics=topics).model_dump_json(),
+    )
+    db.add(extraction)
+    await db.commit()
+    return SessionTopicsOut(topics=topics)
 
 
 @app.post("/api/sessions/{session_id}/ask", response_model=AIResponse)
@@ -196,6 +433,24 @@ async def ask_about_session(
     transcript = "\n".join(segment.text for segment in result)
     try:
         response = await answer_question(transcript, payload.question)
+    except LocalAIError as error:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": error.code, "message": str(error)},
+        ) from error
+    return AIResponse(response=response)
+
+
+@app.post("/api/sessions/{session_id}/explain", response_model=AIResponse)
+async def explain_session_text(
+    session_id: str,
+    payload: ExplainRequest,
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> AIResponse:
+    if await db.get(SessionRecord, session_id) is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    try:
+        response = await explain_technical_text(payload.text)
     except LocalAIError as error:
         raise HTTPException(
             status_code=503,

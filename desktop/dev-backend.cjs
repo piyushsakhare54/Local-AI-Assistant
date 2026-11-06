@@ -21,7 +21,11 @@ async function start() {
   if (health.status !== 'ok' || health.app !== 'ready') {
     throw new Error('The service on port 8765 is not a ready application backend');
   }
-  if (typeof health.speech !== 'string' || typeof health.inference !== 'string') {
+  if (
+    typeof health.speech !== 'string' ||
+    typeof health.inference !== 'string' ||
+    typeof health.vision !== 'string'
+  ) {
     throw new Error(
       'An older backend is already running on port 8765. Stop that process, then run `npm run dev` again.',
     );

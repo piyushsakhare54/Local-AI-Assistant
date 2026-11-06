@@ -118,3 +118,12 @@ class ContradictionExtraction(Base):
         ForeignKey("sessions.id", ondelete="CASCADE"), primary_key=True
     )
     processed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+
+
+class TopicExtraction(Base):
+    __tablename__ = "topic_extractions"
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("sessions.id", ondelete="CASCADE"), primary_key=True
+    )
+    topics_json: Mapped[str] = mapped_column(Text)
+    processed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)

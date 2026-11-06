@@ -17,6 +17,7 @@ from app.services.contradictions import (
     ExtractedStatement,
 )
 from app.services.local_ai import LocalAIError
+from app.services.topic_detection import DetectedTopic, TopicTranscriptSegment
 from app.services.transcription import TranscribedSegment
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -54,6 +55,7 @@ async def test_health_and_local_inference_status(client: AsyncClient) -> None:
     assert response.status_code == 200
     assert response.json()["speech"] in {"ready", "not_configured"}
     assert response.json()["inference"] in {"ready", "model_not_installed", "runtime_unavailable"}
+    assert response.json()["vision"] in {"ready", "model_not_installed", "runtime_unavailable"}
     assert created.status_code == 201
     assert created.json()["mode"] == "interview"
     assert any(row["id"] == created.json()["id"] for row in sessions.json())
@@ -81,6 +83,78 @@ async def test_transcribe_persists_local_transcript(
     assert response.status_code == 200
     assert response.json()[0]["text"] == "Hello there."
     assert transcript.json()[0]["language"] == "en"
+
+
+async def test_live_transcription_returns_segments_with_global_timestamps(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_transcribe(audio: bytes) -> list[TranscribedSegment]:
+        assert audio.startswith(b"RIFF")
+        return [
+            TranscribedSegment("Older overlapping phrase.", 0.1, 0.4, "en"),
+            TranscribedSegment("The latest phrase.", 1.2, 1.8, "en"),
+        ]
+
+    monkeypatch.setattr(main, "transcribe_audio", fake_transcribe)
+    created = await client.post("/api/sessions", json={"title": "Live transcription"})
+    session_id = created.json()["id"]
+    response = await client.post(
+        f"/api/sessions/{session_id}/live-transcribe",
+        params={"offset_seconds": 5, "unique_from_seconds": 5},
+        content=b"RIFF live wave audio",
+        headers={"Content-Type": "audio/wav"},
+    )
+    saved = await client.get(f"/api/sessions/{session_id}/transcript")
+
+    assert response.status_code == 200
+    assert len(response.json()) == 2
+    assert response.json()[1]["text"] == "The latest phrase."
+    assert response.json()[1]["start_time"] == pytest.approx(6.2)
+    assert len(saved.json()) == 2
+    assert saved.json()[0]["text"] == "Older overlapping phrase."
+
+
+async def test_live_transcription_deduplicates_repeated_overlap_segments(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        main,
+        "transcribe_audio",
+        lambda audio: [TranscribedSegment("We need to update the plan.", 0.1, 0.8, "en")],
+    )
+    created = await client.post("/api/sessions", json={"title": "Live overlap"})
+    session_id = created.json()["id"]
+
+    first = await client.post(
+        f"/api/sessions/{session_id}/live-transcribe",
+        params={"offset_seconds": 4.8, "unique_from_seconds": 4.8},
+        content=b"first chunk",
+    )
+    second = await client.post(
+        f"/api/sessions/{session_id}/live-transcribe",
+        params={"offset_seconds": 5, "unique_from_seconds": 5},
+        content=b"overlapping chunk",
+    )
+    saved = await client.get(f"/api/sessions/{session_id}/transcript")
+
+    assert len(first.json()) == 1
+    assert second.json() == []
+    assert len(saved.json()) == 1
+
+
+async def test_live_transcription_rejects_invalid_chunk_offsets(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(main, "transcribe_audio", lambda audio: [])
+    created = await client.post("/api/sessions", json={"title": "Invalid live offset"})
+    response = await client.post(
+        f"/api/sessions/{created.json()['id']}/live-transcribe",
+        params={"offset_seconds": 5, "unique_from_seconds": 6},
+        content=b"audio",
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "invalid_audio_offset"
 
 
 async def test_ai_answers_questions_using_saved_transcript(
@@ -115,6 +189,176 @@ async def test_ai_answers_questions_using_saved_transcript(
     )
     assert response.status_code == 200
     assert response.json()["response"] == "The deadline is Friday."
+
+
+async def test_explain_selected_transcript_text(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    excerpt = "implement an asynchronous event-driven ingestion pipeline"
+
+    async def fake_explain(text: str) -> str:
+        assert text == excerpt
+        return "Simple explanation: build a system that processes incoming data in the background."
+
+    monkeypatch.setattr(main, "explain_technical_text", fake_explain)
+    created = await client.post("/api/sessions", json={"title": "Explain test"})
+    response = await client.post(
+        f"/api/sessions/{created.json()['id']}/explain",
+        json={"text": excerpt},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["response"].startswith("Simple explanation:")
+
+
+async def test_live_answer_uses_conversation_context_and_auto_answer_flag(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_answer(
+        transcript: str,
+        *,
+        question: str | None,
+        auto_answer: bool,
+    ) -> tuple[bool, str]:
+        assert transcript == "The deployment is blocked by missing staging secrets."
+        assert question is None
+        assert auto_answer is True
+        return True, "Ask the platform team to configure the secrets."
+
+    monkeypatch.setattr(main, "answer_live_question", fake_answer)
+    created = await client.post("/api/sessions", json={"title": "Live answer"})
+    response = await client.post(
+        f"/api/sessions/{created.json()['id']}/live-answer",
+        json={
+            "transcript": "The deployment is blocked by missing staging secrets.",
+            "auto_answer": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "answered": True,
+        "response": "Ask the platform team to configure the secrets.",
+    }
+
+
+async def test_screen_analysis_is_sent_to_the_local_vision_service(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_analyze(
+        image_base64: str,
+        *,
+        question: str,
+        transcript: str,
+    ) -> str:
+        assert image_base64 == "c2NyZWVuc2hvdA=="
+        assert question == "What is shown?"
+        assert transcript == "We are reviewing the deployment plan."
+        return "The screen shows the deployment plan."
+
+    monkeypatch.setattr(main, "analyze_screen_image", fake_analyze)
+    created = await client.post("/api/sessions", json={"title": "Screen analysis"})
+    response = await client.post(
+        f"/api/sessions/{created.json()['id']}/analyze-screen",
+        json={
+            "image_base64": "c2NyZWVuc2hvdA==",
+            "question": "What is shown?",
+            "transcript": "We are reviewing the deployment plan.",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["response"] == "The screen shows the deployment plan."
+
+
+async def test_session_topics_use_transcript_timestamps_and_are_cached(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        main,
+        "transcribe_audio",
+        lambda audio: [
+            TranscribedSegment("We should split the application into services.", 4.0, 7.5, "en"),
+            TranscribedSegment("The database query is slow.", 8.0, 10.0, "en"),
+        ],
+    )
+    calls = 0
+
+    async def fake_detect(
+        segments: list[TopicTranscriptSegment],
+    ) -> list[DetectedTopic]:
+        nonlocal calls
+        calls += 1
+        assert [segment.text for segment in segments] == [
+            "We should split the application into services.",
+            "The database query is slow.",
+        ]
+        return [
+            DetectedTopic("Project architecture", "Discussed service boundaries.", 0, 0),
+            DetectedTopic("Database performance", "Identified a slow database query.", 1, 1),
+        ]
+
+    monkeypatch.setattr(main, "detect_topics", fake_detect)
+    created = await client.post("/api/sessions", json={"title": "Topic test"})
+    session_id = created.json()["id"]
+    await client.post(
+        f"/api/sessions/{session_id}/transcribe",
+        content=b"audio",
+        headers={"Content-Type": "audio/webm"},
+    )
+
+    response = await client.post(f"/api/sessions/{session_id}/topics")
+    repeated = await client.post(f"/api/sessions/{session_id}/topics")
+
+    assert response.status_code == 200
+    assert response.json()["topics"][0]["start_time"] == 4.0
+    assert response.json()["topics"][0]["end_time"] == 7.5
+    assert response.json()["topics"][0]["start_segment_id"]
+    assert response.json()["topics"][1]["title"] == "Database performance"
+    assert repeated.json() == response.json()
+    assert calls == 1
+
+
+async def test_new_transcript_segments_invalidate_saved_topics(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transcripts = iter(
+        [
+            [TranscribedSegment("We need a new service boundary.", 0.0, 3.0, "en")],
+            [TranscribedSegment("The database query needs an index.", 5.0, 8.0, "en")],
+        ]
+    )
+    monkeypatch.setattr(main, "transcribe_audio", lambda audio: next(transcripts))
+    calls = 0
+
+    async def fake_detect(
+        segments: list[TopicTranscriptSegment],
+    ) -> list[DetectedTopic]:
+        nonlocal calls
+        calls += 1
+        return [
+            DetectedTopic("Discussion", "The current discussion topic.", 0, len(segments) - 1)
+        ]
+
+    monkeypatch.setattr(main, "detect_topics", fake_detect)
+    created = await client.post("/api/sessions", json={"title": "Topic refresh test"})
+    session_id = created.json()["id"]
+    await client.post(
+        f"/api/sessions/{session_id}/transcribe",
+        content=b"first",
+        headers={"Content-Type": "audio/webm"},
+    )
+    await client.post(f"/api/sessions/{session_id}/topics")
+    await client.post(
+        f"/api/sessions/{session_id}/transcribe",
+        content=b"second",
+        headers={"Content-Type": "audio/webm"},
+    )
+
+    refreshed = await client.post(f"/api/sessions/{session_id}/topics")
+
+    assert calls == 2
+    assert refreshed.json()["topics"][0]["end_time"] == 8.0
 
 
 async def test_commitments_scan_history_status_and_cross_meeting_question(
